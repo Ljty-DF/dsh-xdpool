@@ -684,6 +684,19 @@ export interface PoolWebAccount {
   /** ISO timestamp when the dead mark expires and the account is retried; only while `credentialDead`. */
   credentialDeadUntil?: string
   /**
+   * The gateway's channel verification REFUSED this account (HTTP 400 + business
+   * code 11128), so every chat completion it sends comes back
+   * "请求被拦截，请重新发送".
+   *
+   * Deliberately its own field rather than a flavour of `credentialDead`: the
+   * credential is valid and signing in again does not help, because the refusal
+   * is a per-account rollout state on the gateway's side. The card must not send
+   * the user to re-authenticate over it.
+   */
+  channelRejected?: boolean
+  /** ISO timestamp when the refusal mark expires and the account is retried; only while `channelRejected`. */
+  channelRejectedUntil?: string
+  /**
    * Per-model cooldowns currently active. The account is NOT `cooling` while a
    * model is limited — its other models still serve — but each entry tells the
    * card which model is out until when (e.g. `hy4-preview` cooling to 10:14,

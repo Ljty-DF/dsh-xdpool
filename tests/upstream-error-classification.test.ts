@@ -82,3 +82,39 @@ describe('classifyUpstreamError — recoverable classes must rotate', () => {
     expect(classifyUpstreamError(400, 'bad request')).toBe('client')
   })
 })
+
+describe('classifyUpstreamError — channel verification is its own class', () => {
+  /**
+   * The refusal the gateway answers when its per-account rollout does not accept
+   * this client: HTTP 400, business code 11128, and one of two `msg` values.
+   * Both are the same condition and both must rotate.
+   */
+  it('recognises both wordings of the 11128 refusal', () => {
+    // "request illegal" is what the user reported ("请求被拦截，请重新发送").
+    expect(classifyUpstreamError(400, '{"code":11128,"msg":"request illegal"}')).toBe('channel_rejected')
+    // "conversation id missing" is the wording in the upstream issue thread.
+    expect(classifyUpstreamError(400, '{"code":11128,"msg":"conversation id missing"}')).toBe('channel_rejected')
+  })
+
+  it('recognises the display text even when the code is not in the body', () => {
+    // Proxies and error wrappers sometimes keep only the human-readable half.
+    // The `displayTips` sentence names the check itself, so it is safe on its
+    // own. The bare `displayMsg` is NOT: "请求被拦截" could equally be a content
+    // rejection, which is a request-level problem that rotating cannot fix.
+    for (const body of [
+      'This call failed channel verification, possibly because it was not sent from an official client.',
+      '这次调用没通过渠道校验，可能不是官方客户端发出的。',
+    ]) {
+      expect(classifyUpstreamError(400, body), `body: ${body}`).toBe('channel_rejected')
+    }
+    expect(classifyUpstreamError(400, '请求被拦截，请重新发送')).toBe('client')
+  })
+
+  it('does NOT rotate a malformed request that happens to share code 11128', () => {
+    // 11128 is a REUSED code: the gateway also returns it when it dislikes the
+    // request shape (the developer-role case in `prepareChatBody`). Rotating
+    // that would burn every account on a request none of them can serve.
+    expect(classifyUpstreamError(400, '{"code":11128,"msg":"first message is not system prompt"}')).toBe('client')
+    expect(classifyUpstreamError(400, '{"code":11128}')).toBe('client')
+  })
+})

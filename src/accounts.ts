@@ -117,6 +117,20 @@ export interface WorkBuddyAccount {
    * `0`/undefined means "not known to be dead".
    */
   credentialDeadUntilMs?: number
+  /**
+   * Epoch ms until which this account is skipped because the gateway's channel
+   * verification refused it (HTTP 400 + business code 11128).
+   *
+   * Kept apart from {@link credentialDeadUntilMs} on purpose. Both remove the
+   * account from rotation, but they mean opposite things and need opposite
+   * messages: a dead credential must be signed in again, while a channel refusal
+   * is a rollout state on the ACCOUNT that nothing in this app can fix — the
+   * credential is valid, another account on the same machine is served, and the
+   * only useful action is to let a different account serve.
+   *
+   * `0`/undefined means "never refused".
+   */
+  channelRejectedUntilMs?: number
 }
 
 function nonEmptyEnv(value: unknown): string | undefined {
@@ -576,6 +590,12 @@ export interface AccountPoolOptions {
    * (default 30 minutes). Only a fresh sign-in in the desktop app clears it.
    */
   credentialDeadCooldownMs?: number
+  /**
+   * How long an account rests after the gateway's channel verification refuses
+   * it (default 10 minutes). The credential is fine, so this is shorter than the
+   * sign-in cooldown and cleared by `resetCooldowns`.
+   */
+  channelRejectedCooldownMs?: number
   /** Upstream client used to refresh near-expiry tokens. */
   client?: TokenRefresher
   /** Refresh this long before actual expiry; default five minutes. */
@@ -658,6 +678,26 @@ const EXHAUST_COOLDOWN_MS = 30 * 60 * 1000
 const CREDENTIAL_DEAD_COOLDOWN_MS = 30 * 60 * 1000
 
 /**
+ * Default rest for an account the gateway's channel verification refused.
+ *
+ * The international gateway started checking conversation-identity headers per
+ * account on 2026-10-15/16, rolling the check out account by account. A refused
+ * account answers HTTP 400 + business code 11128 for every chat completion,
+ * while a neighbouring account on the same machine with the same headers is
+ * served normally — so this is an ACCOUNT property, not a request one.
+ *
+ * Why a cooldown is required at all: `acquire` does not know which accounts the
+ * current request already tried, so without taking the refused one out of
+ * rotation the `priority` strategy hands it back on every iteration and the
+ * whole retry budget is spent on one refused account. The rest is deliberately
+ * shorter than the sign-in cooldown: nothing is wrong with the credential, and
+ * the rollout may be reversed — so the account deserves another try sooner than
+ * a revoked sign-in does. A user who wants to retry sooner can clear cooldowns
+ * on the card.
+ */
+const CHANNEL_REJECTED_COOLDOWN_MS = 10 * 60 * 1000
+
+/**
  * Does this refresh failure prove the credential itself is dead?
  *
  * The upstream answers a revoked refresh token with `invalid_grant: Offline user
@@ -687,6 +727,12 @@ export class WorkBuddyAccountPool {
    * sign-in. Cleared by a newer credential file or an explicit sign-in.
    */
   private credentialDeadCooldownMs: number
+  /**
+   * How long an account stays out of rotation after the gateway's channel
+   * verification refused it. Shorter than the sign-in cooldown: the credential
+   * is fine, only the account's rollout state is against it.
+   */
+  private channelRejectedCooldownMs: number
   private readonly client: TokenRefresher | undefined
   private readonly refreshMarginMs: number
   private accounts: WorkBuddyAccount[] = []
@@ -814,6 +860,7 @@ export class WorkBuddyAccountPool {
     this.cooldownMs = options.cooldownMs ?? 60_000
     this.exhaustCooldownMs = options.exhaustCooldownMs ?? EXHAUST_COOLDOWN_MS
     this.credentialDeadCooldownMs = options.credentialDeadCooldownMs ?? CREDENTIAL_DEAD_COOLDOWN_MS
+    this.channelRejectedCooldownMs = options.channelRejectedCooldownMs ?? CHANNEL_REJECTED_COOLDOWN_MS
     this.client = options.client
     this.refreshMarginMs = options.refreshMarginMs ?? 5 * 60 * 1000
     // Priority is the default: users pool their own accounts to spend one
@@ -1079,6 +1126,10 @@ export class WorkBuddyAccountPool {
       // (the upstream never rewrites its expiry), so this is the only thing
       // keeping a dead account from absorbing every retry of a request.
       if ((account.credentialDeadUntilMs ?? 0) > now) return false
+      // Refused by the gateway's channel verification. The credential is fine,
+      // but this account answers 11128 to every chat completion, so retrying on
+      // it can only reproduce the refusal — the next account is the answer.
+      if ((account.channelRejectedUntilMs ?? 0) > now) return false
       if (modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now) return false
       // A region-scoped caller (one of the two providers) must never pick
       // an account that talks to the other region gateway.
@@ -1106,37 +1157,57 @@ export class WorkBuddyAccountPool {
     disabled: number
     /** Accounts skipped because the upstream rejected their sign-in. */
     dead: number
-    reason: 'empty' | 'cooling' | 'disabled' | 'reserve' | 'session_dead' | 'none'
+    /** Accounts skipped because channel verification refused them (11128). */
+    channelRejected: number
+    reason: 'empty' | 'cooling' | 'disabled' | 'reserve' | 'session_dead' | 'channel_rejected' | 'none'
   } {
     const now = Date.now()
     const inRegion = this.accounts.filter(
       account => region === undefined || regionOf(account.credential.domain) === region,
     )
-    if (inRegion.length === 0) return { total: 0, cooling: 0, disabled: 0, dead: 0, reason: 'empty' }
+    if (inRegion.length === 0) {
+      return { total: 0, cooling: 0, disabled: 0, dead: 0, channelRejected: 0, reason: 'empty' }
+    }
 
     let cooling = 0
     let disabled = 0
     let dead = 0
+    let channelRejected = 0
     for (const account of inRegion) {
       if (this.disabledIds.has(account.id)) { disabled += 1; continue }
       // Sign-in rejected: counted separately from "cooling", because the remedy
       // is the opposite one (sign in again, not wait).
       if ((account.credentialDeadUntilMs ?? 0) > now) { dead += 1; continue }
+      // Refused by channel verification: also its own bucket. It is NOT a
+      // credential problem and NOT a rate limit, so reporting it as either one
+      // would send the user to a remedy that cannot work.
+      if ((account.channelRejectedUntilMs ?? 0) > now) { channelRejected += 1; continue }
       const modelCooling = modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now
       if (account.cooldownUntilMs > now || modelCooling) { cooling += 1; continue }
       const reserve = this.creditReserves.get(account.id)
       if (reserve !== undefined && reserve > 0) {
         const balance = this.creditBalances.get(account.id)
         if (balance !== undefined && balance <= reserve) {
-          return { total: inRegion.length, cooling, disabled, dead, reason: 'reserve' }
+          return { total: inRegion.length, cooling, disabled, dead, channelRejected, reason: 'reserve' }
         }
       }
     }
     // A rejected sign-in outranks a cooldown: waiting does not fix it.
-    if (dead > 0) return { total: inRegion.length, cooling, disabled, dead, reason: 'session_dead' }
-    if (cooling > 0) return { total: inRegion.length, cooling, disabled, dead, reason: 'cooling' }
-    if (disabled > 0) return { total: inRegion.length, cooling, disabled, dead, reason: 'disabled' }
-    return { total: inRegion.length, cooling, disabled, dead, reason: 'none' }
+    if (dead > 0) {
+      return { total: inRegion.length, cooling, disabled, dead, channelRejected, reason: 'session_dead' }
+    }
+    // A channel refusal outranks a plain cooldown for the same reason: waiting
+    // for a rate-limit window that is not the cause would be misleading.
+    if (channelRejected > 0) {
+      return { total: inRegion.length, cooling, disabled, dead, channelRejected, reason: 'channel_rejected' }
+    }
+    if (cooling > 0) {
+      return { total: inRegion.length, cooling, disabled, dead, channelRejected, reason: 'cooling' }
+    }
+    if (disabled > 0) {
+      return { total: inRegion.length, cooling, disabled, dead, channelRejected, reason: 'disabled' }
+    }
+    return { total: inRegion.length, cooling, disabled, dead, channelRejected, reason: 'none' }
   }
 
   /** Round-robin: the legacy cursor walk, kept for the distribution that asks for it. */
@@ -1524,6 +1595,33 @@ export class WorkBuddyAccountPool {
   }
 
   /**
+   * Cool a whole account because the gateway's channel verification refused it.
+   *
+   * Called with direct evidence (the chat completion just came back 400/11128),
+   * so no guessing is involved. Without it `acquire` keeps returning the same
+   * account — it is not cooling for any other reason — and `maxAttempts` retries
+   * all land there while the accounts that WOULD be served go unused. That is
+   * the "请求被拦截，请重新发送" loop: resending never helped, because the pool
+   * had no idea one of its members was refused.
+   */
+  penalizeChannelRejected(accountId: string): void {
+    const account = this.accounts.find(item => item.id === accountId)
+    if (account === undefined) return
+    const until = Date.now() + this.channelRejectedCooldownMs
+    account.channelRejectedUntilMs = Math.max(account.channelRejectedUntilMs ?? 0, until)
+    this.logger?.warn(
+      `dsh-xdpool: ${account.label} was refused by channel verification; `
+        + `keeping it out of rotation until ${new Date(until).toISOString()}`,
+    )
+  }
+
+  /** Accounts currently kept out of rotation because channel verification refused them. */
+  channelRejectedAccounts(): readonly WorkBuddyAccount[] {
+    const now = Date.now()
+    return this.accounts.filter(account => (account.channelRejectedUntilMs ?? 0) > now)
+  }
+
+  /**
    * Refresh the account's access token when it is within the margin (or already
    * expired), in-flight de-duped per account. A failed refresh keeps the
    * existing token when it has not yet expired, so an unreachable refresh
@@ -1664,17 +1762,27 @@ ${new Date(until).toISOString()}
       // next request re-marks it, so the cost of clearing is one failed attempt
       // and the benefit is that a working account is never hidden by a stale mark.
       account.credentialDeadUntilMs = 0
+      // Same reasoning for a channel refusal: the rollout can be reversed, and
+      // "clear all cooldowns" is the user asking to try every account again.
+      account.channelRejectedUntilMs = 0
     }
   }
 
   /** Diagnostics snapshot. Account-wide cooling count (per-model cooling excluded:
    *  the account as a whole stays usable when only one model is limited). */
-  status(): { count: number; cooling: number; dead: number; lastScanAtMs: number } {
+  status(): {
+    count: number
+    cooling: number
+    dead: number
+    channelRejected: number
+    lastScanAtMs: number
+  } {
     const now = Date.now()
     return {
       count: this.accounts.length,
       cooling: this.accounts.filter(account => account.cooldownUntilMs > now).length,
       dead: this.accounts.filter(account => (account.credentialDeadUntilMs ?? 0) > now).length,
+      channelRejected: this.accounts.filter(account => (account.channelRejectedUntilMs ?? 0) > now).length,
       lastScanAtMs: this.lastScanAtMs,
     }
   }

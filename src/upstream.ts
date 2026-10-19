@@ -22,6 +22,7 @@ export type UpstreamErrorKind =
   | 'hard_credit'
   | 'soft_rate'
   | 'session_dead'
+  | 'channel_rejected'
   | 'not_found'
   | 'server'
   | 'client'
@@ -274,6 +275,60 @@ const SESSION_DEAD_MARKERS = [
 ]
 
 /**
+ * Markers for "this ACCOUNT was refused by channel verification".
+ *
+ * 国际网关自 2026-10-15/16 起按账号灰度校验会话身份头，命中灰度的账号会对
+ * `/v2/chat/completions` 回 HTTP 400 + 业务码 11128，`displayTips` 写着
+ * 「这次调用没通过渠道校验，可能不是官方客户端发出的」。
+ *
+ * 为什么必须单独分类
+ *
+ * 这是**账号级**条件，不是请求级条件：同一个请求换一个没被灰度的账号就能过。
+ * 归到 `client` 时它是终止类，于是池子里只要有一个账号命中灰度，整个请求就
+ * 直接失败、其余健康账号一次都不会被尝试——正是用户看到的「请求被拦截，请
+ * 重新发送」，而且重发多少次都落在同一个账号上。
+ *
+ * 为什么按文案而不是按业务码
+ *
+ * 11128 是复用码：`prepareChatBody` 的文档注释里记着它同样表示 `developer` role
+ * 被拒（正是那个方法把 `developer` 改写成 `system`）。按码匹配会把「请求体
+ * 格式错误」也当成账号问题去轮换，白烧一遍账号池。渠道校验有它独有的措辞，
+ * 就按措辞匹配。
+ *
+ * 两种 `msg` 共用同一个码和同一段 `displayTips`（issue #46 的
+ * `conversation id missing` 与 issue #48 的 `request illegal`），所以匹配的是
+ * `displayTips` 里那句固定的提示，而不是 `msg`。
+ */
+const CHANNEL_REJECTED_MARKERS = [
+  'channel verification', '渠道校验',
+  'not sent from an official client', '不是官方客户端发出的',
+  'conversation id missing',
+]
+
+/**
+ * Whether this body is the channel-verification refusal.
+ *
+ * Two rules, because the wording varies while the code does not:
+ *
+ *  - the fixed `displayTips` sentence (English or Chinese) — always present, and
+ *    the only part of the body that is stable across the two known `msg` forms;
+ *  - business code 11128 together with one of its two known `msg` texts. The
+ *    code alone is not enough: 11128 also covers a `developer`-role rejection,
+ *    which is a request-shape problem that would fail identically on every
+ *    account. `request illegal` alone is not enough either — it is too generic
+ *    to attribute to the channel check without the code beside it.
+ */
+function isChannelRejection(body: string): boolean {
+  const lower = body.toLowerCase()
+  for (const marker of CHANNEL_REJECTED_MARKERS) {
+    if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return true
+  }
+  const hasCode = body.includes('11128')
+  if (!hasCode) return false
+  return lower.includes('request illegal') || lower.includes('conversation id missing')
+}
+
+/**
  * Markers for "already checked in today".
  *
  * The upstream answers a non-zero business code (and HTTP 400) when the daily
@@ -416,6 +471,94 @@ const CHAT_IDENTITY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
   'X-IDE-Type': 'WorkBuddy',
   'X-IDE-Version': '5.5.6',
 })
+
+/**
+ * 会话身份头：官方桌面端每次 chat completion 都会带，国际网关自 2026-10-15/16
+ * 起按账号灰度校验它。
+ *
+ * 为什么需要这一组
+ *
+ * 缺少会话身份时，国际网关的 `/v2/chat/completions` 会以业务码 11128 拒绝，
+ * `displayTips` 写着「这次调用没通过渠道校验，可能不是官方客户端发出的」。
+ * `msg` 文案会在 `conversation id missing` 与 `request illegal` 之间变化，
+ * 但业务码和提示语完全一致。这两个字符串在官方客户端 bundle 里一处都搜不到，
+ * 说明不存在「客户端错误表」需要对齐——唯一能动的就是我们发出去的请求头。
+ *
+ * 官方桌面端在 `main/daemon-bootstrap.js` 的 `Yr(e, t, n)` 里统一装配聊天请求，
+ * 这几个头就在那里设置。
+ *
+ * 两种寿命，这是关键
+ *
+ *  - 会话级稳定：`X-Conversation-ID`、`X-Conversation-Request-ID`、
+ *    `acp-connection-id`。桌面端每个会话铸造一次、全程复用；我们改为从
+ *    conversation key 派生，因此不需要有状态注册表，同一个会话在每一轮、
+ *    每一个轮换到的账号上都保持同一个网关身份。
+ *  - 每请求新生成：`X-Conversation-Message-ID`、`X-Request-ID`，每次都是新的
+ *    `randomUUID()`，与桌面端一致。
+ *
+ * 特别是 `X-Request-ID` 必须是真 UUID：积分自动化的 `openConversation()` 发的是
+ * `String(Date.now()) + '000000'`，那不是一个 UUID。
+ *
+ * 与 `CHAT_IDENTITY_HEADERS` 同理，这组头只属于 `/v2/chat/completions`，
+ * 不能污染积分自动化那几个接口。
+ */
+const CHAT_CONVERSATION_HEADERS: Readonly<Record<string, string>> = Object.freeze({
+  'X-Agent-Intent': 'craft',
+  'X-Agent-Purpose': 'conversation',
+  'X-Private-Data': 'true',
+  'x-codebuddy-request': '1',
+})
+
+/**
+ * 从 conversation key 派生三个会话级稳定的 id。
+ *
+ * 刻意做成确定性派生：`conversationKeyOf()` 已经是插件里稳定的「每会话身份」
+ * （sticky 分发就绑在它上面），从它派生既不需要内存注册表，重启后也保持一致。
+ * 于是同一个会话在每次调用、每个轮换账号上都呈现同一个身份——这正是网关在查的。
+ */
+export function chatConversationIdentityOf(conversationKey: string): {
+  conversationId: string
+  conversationRequestId: string
+  acpConnectionId: string
+} {
+  const digest = (salt: string): string =>
+    createHash('sha256').update(salt + ':' + conversationKey).digest('hex')
+  const asUuid = (hex: string): string =>
+    `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
+  return {
+    // 沿用自动化 opener 已有的 `wb2auto-conv-` 家族，保持网关见过的 id 形状。
+    conversationId: `wb2auto-conv-${digest('conversation').slice(0, 24)}`,
+    conversationRequestId: asUuid(digest('conversation-request')),
+    acpConnectionId: asUuid(digest('acp-connection')),
+  }
+}
+
+/**
+ * 装配一次 chat completion 的完整请求头。
+ *
+ * 刻意不并进 `chatHeaders()`：那个函数与积分自动化接口
+ * （`listTasks` / `acceptTasks` / `marketExpertList`）共用，那些不是聊天补全，
+ * 从来不带聊天身份。
+ *
+ * 缺少 `conversationKey` 时退化为随机值，而不是省略这组头：被网关拒绝，
+ * 比身份只是「仅此一次唯一」要糟得多。
+ */
+function chatCompletionHeaders(
+  credential: WorkBuddyCredential,
+  conversationKey: string | undefined,
+): Record<string, string> {
+  const identity = chatConversationIdentityOf(conversationKey ?? randomUUID())
+  return {
+    ...chatHeaders(credential),
+    ...CHAT_IDENTITY_HEADERS,
+    ...CHAT_CONVERSATION_HEADERS,
+    'X-Conversation-ID': identity.conversationId,
+    'X-Conversation-Request-ID': identity.conversationRequestId,
+    'acp-connection-id': identity.acpConnectionId,
+    'X-Conversation-Message-ID': randomUUID(),
+    'X-Request-ID': randomUUID(),
+  }
+}
 
 /** Refresh-endpoint headers; X-Refresh-Token appears here and nowhere else. */
 function refreshHeaders(credential: WorkBuddyCredential): Record<string, string> {
@@ -653,6 +796,10 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   // upstream words 401/403 inconsistently, and marker-only matching let
   // "api密钥无效" / "invalid api key" / "unauthorized" slip through.
   if (status === 401 || status === 403) return 'session_dead'
+  // Channel verification is an ACCOUNT-level refusal, so it must rotate rather
+  // than end the request. Checked before the marker loops because its body also
+  // contains generic words ("request illegal") that other classes must not claim.
+  if (isChannelRejection(body)) return 'channel_rejected'
   const lower = body.toLowerCase()
   for (const marker of HARD_CREDIT_MARKERS) {
     if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
@@ -1204,10 +1351,11 @@ export class WorkBuddyUpstreamClient {
     credential: WorkBuddyCredential,
     prepared: string,
     signal?: AbortSignal,
+    conversationKey?: string,
   ): Promise<string> {
     const response = await this.fetchImpl(`${chatBase(credential)}/v2/chat/completions`, {
       method: 'POST',
-      headers: { ...chatHeaders(credential), ...CHAT_IDENTITY_HEADERS },
+      headers: chatCompletionHeaders(credential, conversationKey),
       body: prepared,
       ...signal === undefined ? {} : { signal },
     })
@@ -1224,12 +1372,13 @@ export class WorkBuddyUpstreamClient {
     credential: WorkBuddyCredential,
     prepared: string,
     signal?: AbortSignal,
+    conversationKey?: string,
   ): Promise<ChatStreamResult> {
     let response: Response
     try {
       response = await this.fetchImpl(`${chatBase(credential)}/v2/chat/completions`, {
         method: 'POST',
-        headers: { ...chatHeaders(credential), ...CHAT_IDENTITY_HEADERS },
+        headers: chatCompletionHeaders(credential, conversationKey),
         body: prepared,
         ...signal === undefined ? {} : { signal },
       })

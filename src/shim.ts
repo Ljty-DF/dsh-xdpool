@@ -131,6 +131,10 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   hard_credit: 402,
   soft_rate: 429,
   session_dead: 401,
+  // Channel verification is a 400 upstream, and stays a 400 here: the request
+  // itself was well formed, so telling the caller 401/403 would send it looking
+  // for a credential problem that does not exist.
+  channel_rejected: 400,
   not_found: 502,
   server: 502,
   client: 400,
@@ -625,6 +629,10 @@ function withBareModelId(raw: string, modelId: string): string {
     }
     const attempts: string[] = []
     let last: { kind: string; status: number; message: string } | undefined
+    // A chain member's chat completion needs the same conversation identity the
+    // plain pool path sends; derive it once so every member of the chain speaks
+    // for the same conversation.
+    const comboConversationKey = conversationKeyOf(raw)
     for (const member of members) {
       if (signal.aborted) return
       attempts.push(member.modelId)
@@ -646,7 +654,12 @@ function withBareModelId(raw: string, modelId: string): string {
           continue
         }
         const prepared = client.prepareChatBody(raw)
-        const result = await client.chatStream(account.credential, prepared, signal)
+        const result = await client.chatStream(
+          account.credential,
+          prepared,
+          signal,
+          comboConversationKey,
+        )
         if (result.ok) {
           const turnId = randomBytes(8).toString('hex')
           await serveSuccessfulStream(
@@ -666,6 +679,11 @@ function withBareModelId(raw: string, modelId: string): string {
         if (result.kind === 'soft_rate') pool.penalize(account.id, parseRateLimitReset(result.message), member.modelId)
         else if (result.kind === 'session_dead') pool.penalizeCredentialDead(account.id)
         else if (result.kind === 'hard_credit') pool.penalizeExhausted(account.id)
+        // Chain members are pool accounts too, so a channel refusal here means
+        // the same thing it does on the plain path: this account cannot serve
+        // chat completions at all right now. Cool it so the next member — and
+        // the next request — does not land on it again.
+        else if (result.kind === 'channel_rejected') pool.penalizeChannelRejected(account.id)
         continue
       }
       if (store === undefined || aggregate === undefined) {
@@ -882,6 +900,23 @@ function withBareModelId(raw: string, modelId: string): string {
           )
           return
         }
+        if (why.reason === 'channel_rejected') {
+          // The one condition the user cannot fix by waiting or re-authenticating:
+          // the gateway's per-account rollout refuses these accounts whatever we
+          // send. Say so, and name the way out (another account, or the CN
+          // gateway) instead of the generic "sign in again".
+          writeOpenAIError(
+            res,
+            400,
+            'channel_rejected',
+            `${why.channelRejected}/${why.total} WorkBuddy account(s) for this gateway are being `
+              + 'refused by channel verification (business code 11128), so none can serve a chat '
+              + 'completion right now. The credential is fine — the gateway rejects these accounts '
+              + 'specifically. Add another account, or switch to the CN gateway; cooldowns are cleared '
+              + 'from the pool card once the rollout lets them through again.',
+          )
+          return
+        }
         if (why.reason === 'session_dead') {
           // Distinct from "never signed in": these accounts HAVE credentials, the
           // upstream just refuses them now. Waiting does not help, and saying
@@ -906,7 +941,12 @@ function withBareModelId(raw: string, modelId: string): string {
         return
       }
       tried.push(account.label)
-      const result = await client.chatStream(account.credential, prepared, controller.signal)
+      const result = await client.chatStream(
+        account.credential,
+        prepared,
+        controller.signal,
+        conversationKey,
+      )
       if (result.ok) {
         // Success is filed by the stream forwarder, the only place that knows
         // when the stream really ended and what it cost.
@@ -957,6 +997,19 @@ function withBareModelId(raw: string, modelId: string): string {
         pool.penalizeExhausted(account.id)
         logger?.warn(
           `dsh-xdpool: ${account.label} has no credits left `
+            + `(attempt ${attempt + 1}/${maxAttempts}); rotating`,
+        )
+        continue
+      }
+      // Channel verification is an ACCOUNT condition: the gateway's rollout
+      // refuses this account's chat completions with 11128 while other accounts
+      // on the same machine and the same headers are served. Rotating is the
+      // whole fix — failing here is what produced "请求被拦截，请重新发送", where
+      // resending simply landed on the same refused account forever.
+      if (result.kind === 'channel_rejected') {
+        pool.penalizeChannelRejected(account.id)
+        logger?.warn(
+          `dsh-xdpool: ${account.label} was refused by channel verification (11128) `
             + `(attempt ${attempt + 1}/${maxAttempts}); rotating`,
         )
         continue
@@ -1293,6 +1346,10 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
   let summary: string | undefined
   let compacted: ChatMessage[] = messages
   let compactionDetail = ''
+  // Compaction belongs to the SAME conversation as the turn that overran, so its
+  // summarising call carries the same conversation identity. Derived from `raw`,
+  // which RecoverOptions already carries.
+  const conversationKey = conversationKeyOf(raw)
   try {
     const summariser = await pool.acquire(modelId, region)
     if (summariser === undefined) {
@@ -1307,7 +1364,12 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
               { ...parsed, stream: true, max_tokens: Math.max(256, Math.floor(budget / 2)) },
               request,
             )
-            return await client.completeChat(summariser.credential, body, signal ?? controller.signal)
+            return await client.completeChat(
+              summariser.credential,
+              body,
+              signal ?? controller.signal,
+              conversationKey,
+            )
           },
         },
         controller.signal,
@@ -1334,7 +1396,12 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
     const account = await pool.acquire(modelId, region)
     if (account === undefined) return { ok: false, detail: 'no account available after compaction' }
     tried.push(account.label)
-    const result = await client.chatStream(account.credential, retryBody, controller.signal)
+    const result = await client.chatStream(
+      account.credential,
+      retryBody,
+      controller.signal,
+      conversationKey,
+    )
     if (!result.ok) {
       // A refusal is filed like any other failed physical call. The success
       // below deliberately is NOT: that one is filed by the forwarder when the
@@ -1369,6 +1436,12 @@ async function recoverFromContextOverrun(options: RecoverOptions): Promise<Recov
     }
     if (result.kind === 'hard_credit') {
       pool.penalizeExhausted(account.id)
+      continue
+    }
+    if (result.kind === 'channel_rejected') {
+      // Same rule as the main loop: the gateway refuses this account, not this
+      // request, so cool it and let the next account serve the compacted retry.
+      pool.penalizeChannelRejected(account.id)
       continue
     }
     if (result.kind === 'soft_rate') {

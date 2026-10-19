@@ -2046,6 +2046,7 @@ function AccountBlock({
   const isPreferred = account.preferred === true
   const isCooling = account.cooling === true
   const isDead = account.credentialDead === true
+  const isRefused = account.channelRejected === true
   const cooldownUntil = account.cooldownUntil !== undefined ? Date.parse(account.cooldownUntil) : undefined
   const modelCooldowns = account.modelCooldowns ?? []
   // Only a whole-account cooldown gets a tag. Per-model cooldowns do NOT mark
@@ -2059,11 +2060,16 @@ function AccountBlock({
   //
   // A rejected sign-in outranks "cooling": a cooldown lifts on its own, this
   // one needs the user to sign in again, so it is the more useful thing to say.
+  // A channel refusal ranks just below it: it also does not lift by waiting, but
+  // unlike a dead sign-in there is nothing the user can re-authenticate away, so
+  // the hint beside the row carries the remedy instead.
   const tag = isDead
     ? { text: t?.('row.credentialDeadTag') ?? 'Sign-in rejected', cls: 'dsm-xdpool-account-tag dsm-xdpool-account-tag-dead' }
-    : isCooling
-      ? { text: t?.('row.cooling') ?? 'Cooling', cls: 'dsm-xdpool-account-tag dsm-xdpool-account-tag-cooling' }
-      : null
+    : isRefused
+      ? { text: t?.('row.channelRejectedTag') ?? 'Channel check refused', cls: 'dsm-xdpool-account-tag dsm-xdpool-account-tag-dead' }
+      : isCooling
+        ? { text: t?.('row.cooling') ?? 'Cooling', cls: 'dsm-xdpool-account-tag dsm-xdpool-account-tag-cooling' }
+        : null
   return (
     <div className={isDisabled ? 'dsm-xdpool-account dsm-xdpool-account-off' : 'dsm-xdpool-account'}
          data-serving={serving === true ? 'true' : undefined}
@@ -2148,6 +2154,12 @@ function AccountBlock({
           {isDead
             ? <span className="dsm-xdpool-account-meta dsm-xdpool-account-meta-dead">
                 {t?.('row.credentialDeadHint') ?? 'Sign in again in the WorkBuddy desktop app to restore it'}
+              </span>
+            : null}
+          {isRefused && !isDead
+            ? <span className="dsm-xdpool-account-meta dsm-xdpool-account-meta-dead">
+                {t?.('row.channelRejectedHint')
+                  ?? 'The gateway refuses this account (11128); the credential is fine — add another account or switch gateway'}
               </span>
             : null}
           {modelCooldowns.length > 0

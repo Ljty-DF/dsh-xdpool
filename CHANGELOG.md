@@ -1,6 +1,28 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 未发布 — 「请求被拦截，请重新发送」不再是一个死循环
+> 10 月 15/16 日起，国际网关对 `/v2/chat/completions` 按账号灰度加了渠道校验。命中灰度的账号每次对话都返回 400 + 业务码 11128，用户看到的就是「请求被拦截，请重新发送」——而重发永远没用，因为池子既没补上校验要看的头，也没意识到这个账号已经不能用了。
+### 补齐网关要看的会话身份头
+上游的渠道校验要的是官方客户端每会话铸造的那组头。此前插件只在积分自动化的探针路径上带了一部分，真正承载用户流量的两条路径（`chatStream`、`completeChat`）一个都没有，所以命中灰度的账号必然被拒。
+现在新增 `chatCompletionHeaders(credential, conversationKey?)`，两条路径统一走它，补齐：
+- 会话级稳定（同一会话每次相同）：`X-Conversation-ID`、`X-Conversation-Request-ID`、`acp-connection-id`
+- 每请求新铸：`X-Conversation-Message-ID`、`X-Request-ID`（此前积分路径上的 `X-Request-ID` 根本不是 UUID，这里是规范的 UUID）
+- 固定声明：`X-Agent-Intent: craft`、`X-Agent-Purpose: conversation`、`x-codebuddy-request: 1`、`X-Private-Data: true`
+三个会话级 id 由会话键确定性派生，同一会话稳定、不同会话不同。`shim.ts` 四处用户流量入口（组合链、主池、压缩摘要、压缩重试）都传入了会话键。
+**没有**把这些头塞进共享的 `chatHeaders()`：积分自动化的 `listTasks`/`acceptTasks`/`marketExpertList` 从没被证明要这些头，凭空给它们安一个会话身份是另一回事。测试双向钉住了这条边界。
+### 渠道校验被拒时换号，而不是整个请求失败
+第二处问题是错误分类。`classifyUpstreamError` 此前把 400 一律判成 `client`，而 `client` 是**终止分支**——池子里只要有一个账号命中灰度，整个请求就失败，其余健康账号一次都不试。用户重发，`priority` 又把同一个账号递回来，于是形成闭环。
+新增错误类 `channel_rejected`：
+- 按**措辞**识别，不只看业务码——11128 是复用码，`prepareChatBody` 已记录它还表示 developer role 被拒，那属于请求形状问题，换号只会把整池烧光。识别依据是 `displayTips` 里那句「没通过渠道校验」/`channel verification`，或「11128 + `request illegal` / `conversation id missing`」这个组合。
+- 主池、组合链、压缩重试三个循环都改为惩罚该账号并 `continue`，让下一个账号接手。
+- 账号池新增 `penalizeChannelRejected()`，把账号移出轮换 **10 分钟**（`CHANNEL_REJECTED_COOLDOWN_MS`）。必须冷却，因为 `acquire` 不知道本次请求已经试过哪些账号；比凭证死亡冷却（30 分钟）短，因为凭证是好的、灰度可能反转。
+- 全池都被拒时回 `400 channel_rejected`（不是 401），文案明确说「凭证没问题、是网关按账号拒绝」，并给出「加账号 / 切 CN 网关 / 在池卡片清冷却」三条出路——避免把用户送去重新登录一个本来就没问题的账号。
+- 账号池卡片新增「未通过渠道校验」标签与说明，与「登录已被拒绝」分开显示：两者都要移出轮换，但含义相反、提示相反。处于该状态的账号也不再探测积分与签到，否则若同一道闸门也管这些接口，失败会被 `isGatewayRejectionError` 记成「登录已死」，把用户引向错误的修法。
+### 测试
+- 新增 `tests/channel-rejected.test.ts`（5 例）：被拒后由其它账号接手、被拒账号不再被递回、全池被拒时报 `400 channel_rejected` 且文案不含「重新登录」、`unavailableReason` 报 `channel_rejected` 而非 `cooling`、`resetCooldowns()` 能清掉。
+- `tests/upstream-error-classification.test.ts` 增加 3 例：两种 11128 措辞、`displayTips` 单独出现、以及「11128 + developer role 必须保持 `client` 不误换号」。
+- `tests/chat-identity-headers.test.ts` 增加 5 例：两条路径都带会话头、同会话三个 id 稳定而两个每请求 id 变化、不同会话 id 不同、无会话键时仍发合法 UUID、非对话端点不沾这些头。
 ## 2.3.0 — 扫码渠道接入账号池，免密车道修复，数据看板有了真数
 > 这一版收掉三件大事：扫码登录的账号真正归入账号池并按渠道展示；免费模型车道跟上上游的新校验、不再动辄 403；数据看板不再是一排零。
 ### 账号池：扫码渠道按渠道入池、逐模型可控

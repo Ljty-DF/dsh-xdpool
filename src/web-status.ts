@@ -718,6 +718,8 @@ function toWebAccount(account: WorkBuddyAccount, disabled: boolean, preferred: b
   const cooling = account.cooldownUntilMs > now
   const deadUntil = account.credentialDeadUntilMs ?? 0
   const credentialDead = deadUntil > now
+  const refusedUntil = account.channelRejectedUntilMs ?? 0
+  const channelRejected = refusedUntil > now
   const modelCooldowns = Object.entries(account.modelCooldowns)
     .filter(([, until]) => until > now)
     .sort((a, b) => a[1] - b[1])
@@ -734,6 +736,8 @@ function toWebAccount(account: WorkBuddyAccount, disabled: boolean, preferred: b
     ...cooling ? { cooldownUntil: new Date(account.cooldownUntilMs).toISOString() } : {},
     credentialDead,
     ...credentialDead ? { credentialDeadUntil: new Date(deadUntil).toISOString() } : {},
+    channelRejected,
+    ...channelRejected ? { channelRejectedUntil: new Date(refusedUntil).toISOString() } : {},
     ...modelCooldowns.length === 0 ? {} : { modelCooldowns },
     disabled,
     preferred,
@@ -821,7 +825,14 @@ export async function poolWebStatus(
     // Dead sign-ins are skipped outright: the upstream already said no, so
     // re-probing them on every card refresh only adds two guaranteed 401s per
     // account (and a wall of red text the user cannot act on beyond signing in).
-    if (!row.cooling && row.credentialDead !== true) {
+    //
+    // Channel-refused accounts are skipped for a different reason: we do not
+    // know whether the same gate covers the credits endpoint. If it does, the
+    // probe fails and `isGatewayRejectionError` files the failure as a DEAD
+    // SIGN-IN — telling the user to re-authenticate over a problem signing in
+    // cannot fix. Staying silent for the cooldown is the honest answer, and the
+    // row already carries the reason.
+    if (!row.cooling && row.credentialDead !== true && row.channelRejected !== true) {
       // Tracked locally as well as on the row: TypeScript keeps `row.credentialDead`
       // narrowed to false here, and the check-in probe below must see the mark
       // this iteration just made.
